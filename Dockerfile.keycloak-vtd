@@ -1,0 +1,8 @@
+FROM ghcr.io/bon5co/keycloak-railway:26.7.2
+USER root
+COPY keycloak/vtd-realm-import.template.json /opt/keycloak/data/import/vtd-realm-import.template.json
+COPY keycloak/entrypoint-vtd.sh /usr/local/bin/entrypoint-vtd.sh
+RUN chmod 0755 /usr/local/bin/entrypoint-vtd.sh \
+    && chown -R 1000:0 /opt/keycloak/data/import
+USER 1000
+ENTRYPOINT ["/usr/local/bin/entrypoint-vtd.sh"]
