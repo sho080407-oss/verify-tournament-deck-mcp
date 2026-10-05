@@ -4,6 +4,7 @@ WORKDIR /app
 RUN addgroup --system vtd && adduser --system --ingroup vtd --home /home/vtd vtd \
     && mkdir -p /data/vtd && chown -R vtd:vtd /data/vtd /home/vtd
 COPY rc6_runtime_min.zip /tmp/rc6_runtime_min.zip
+COPY railway_bootstrap.py /app/railway_bootstrap.py
 RUN python -m zipfile -e /tmp/rc6_runtime_min.zip /app \
     && pip install --no-cache-dir -r /app/requirements.txt \
     && rm -f /tmp/rc6_runtime_min.zip \
@@ -12,4 +13,4 @@ ENV MCP_HOST=0.0.0.0 MCP_TRANSPORT=streamable-http VTD_ENV=production VTD_DATA_D
     VTD_RUN_LOCK_TIMEOUT=30 VTD_RUNSTORE_LEGACY_MIRROR=1 VTD_LOG_LEVEL=INFO
 EXPOSE 10000
 USER vtd
-CMD ["sh", "-c", "uvicorn render_entrypoint:app --host 0.0.0.0 --port ${PORT:-10000} --proxy-headers"]
+CMD ["sh", "-c", "uvicorn railway_bootstrap:app --host 0.0.0.0 --port ${PORT:-10000} --proxy-headers"]
