@@ -10,7 +10,6 @@ RUN python -m zipfile -e /tmp/rc6_runtime_min.zip /app \
     && chown -R vtd:vtd /app
 ENV MCP_HOST=0.0.0.0 MCP_TRANSPORT=streamable-http VTD_ENV=production VTD_DATA_DIR=/data/vtd \
     VTD_RUN_LOCK_TIMEOUT=30 VTD_RUNSTORE_LEGACY_MIRROR=1 VTD_LOG_LEVEL=INFO
-VOLUME ["/data/vtd"]
 EXPOSE 10000
 USER vtd
 CMD ["sh", "-c", "uvicorn render_entrypoint:app --host 0.0.0.0 --port ${PORT:-10000} --proxy-headers"]
