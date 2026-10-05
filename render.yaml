@@ -1,0 +1,33 @@
+services:
+  - type: web
+    runtime: docker
+    name: tournament-deck-verifier
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    healthCheckPath: /healthz
+    renderSubdomainPolicy: enabled
+    envVars:
+      - key: VTD_ENV
+        value: production
+      - key: VTD_DATA_DIR
+        value: /data/vtd
+      - key: VTD_AUTH_MODE
+        value: oidc
+      - key: VTD_AUTH_ISSUER_URL
+        sync: false
+      - key: VTD_JWT_ALGORITHMS
+        value: RS256
+      - key: VTD_JWKS_CACHE_TTL
+        value: "300"
+      - key: VTD_JWT_CLOCK_SKEW
+        value: "60"
+      - key: VTD_RUN_LOCK_TIMEOUT
+        value: "30"
+      - key: VTD_RUNSTORE_LEGACY_MIRROR
+        value: "1"
+      - key: VTD_LOG_LEVEL
+        value: INFO
+    disk:
+      name: verifier-data
+      mountPath: /data/vtd
+      sizeGB: 1

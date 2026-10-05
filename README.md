@@ -1,19 +1,17 @@
-# verify-tournament-deck RC6 public fast track
+# verify-tournament-deck MCP — RC6
 
-Deployment repository for **v20.18.25 / Bridge 26 / RC6**.
+Production deployment repository for **v20.18.25 / Bridge 26 / RC6**.
 
-This repository is intended for a production Render deployment of the remote MCP server without changing the frozen verifier core.
+The frozen RC6 runtime is stored as `rc6_runtime_min.zip` and expanded during the Docker build.
 
-## Deploy
+## Render deployment
 
-1. Import this repository into Render using `render.yaml`.
-2. Set the required environment variables shown in `.env.production.example`.
-3. Deploy and confirm `/healthz` is healthy.
-4. Use the assigned hostname with `derive_submission_inputs.py` to produce the final OpenAI Directory submission inputs.
-5. Run `scripts/final_public_release.py` with real publisher/OAuth/reviewer inputs.
+1. Create a Render Blueprint from this repository.
+2. Set `VTD_AUTH_ISSUER_URL` to the production OIDC issuer.
+3. Deploy and confirm `/healthz`.
+4. Public MCP: `https://<render-host>/mcp`.
+5. Public listing pages are served from the same host.
 
-See `FAST_TRACK_DEPLOYMENT.md` for the complete handoff.
+Do not commit OAuth secrets, reviewer tokens, private keys, real `.env` files, or OpenAI domain-challenge tokens.
 
-## Security
-
-Do not commit real `.env` files, OAuth client secrets, reviewer tokens, private keys, or OpenAI domain-challenge tokens.
+RC6 runtime SHA-256: `a0745bb66bc4906f3eb13824475230325123656ac03ad545475bc94e16f89d78`
