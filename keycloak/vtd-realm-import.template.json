@@ -1,0 +1,69 @@
+{
+  "realm": "vtd",
+  "enabled": true,
+  "sslRequired": "external",
+  "registrationAllowed": false,
+  "resetPasswordAllowed": true,
+  "rememberMe": true,
+  "loginWithEmailAllowed": false,
+  "duplicateEmailsAllowed": false,
+  "verifyEmail": false,
+  "clients": [
+    {
+      "clientId": "chatgpt-vtd",
+      "name": "ChatGPT Verify Tournament Deck",
+      "enabled": true,
+      "protocol": "openid-connect",
+      "publicClient": true,
+      "standardFlowEnabled": true,
+      "implicitFlowEnabled": false,
+      "directAccessGrantsEnabled": false,
+      "serviceAccountsEnabled": false,
+      "frontchannelLogout": false,
+      "redirectUris": ["https://chatgpt.com/connector_platform_oauth_redirect"],
+      "webOrigins": ["https://chatgpt.com"],
+      "attributes": {"pkce.code.challenge.method": "S256"},
+      "optionalClientScopes": ["deck:verify"]
+    }
+  ],
+  "clientScopes": [
+    {
+      "name": "deck:verify",
+      "description": "Authorize verification operations for verify-tournament-deck MCP.",
+      "protocol": "openid-connect",
+      "attributes": {
+        "include.in.token.scope": "true",
+        "display.on.consent.screen": "true"
+      },
+      "protocolMappers": [
+        {
+          "name": "mcp-audience",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-audience-mapper",
+          "consentRequired": false,
+          "config": {
+            "included.custom.audience": "https://verify-tournament-deck-mcp-production.up.railway.app/mcp",
+            "id.token.claim": "false",
+            "access.token.claim": "true",
+            "introspection.token.claim": "true"
+          }
+        }
+      ]
+    }
+  ],
+  "users": [
+    {
+      "username": "openai-reviewer",
+      "enabled": true,
+      "emailVerified": false,
+      "requiredActions": [],
+      "credentials": [
+        {
+          "type": "password",
+          "value": "__VTD_REVIEWER_PASSWORD__",
+          "temporary": false
+        }
+      ]
+    }
+  ]
+}
