@@ -8,6 +8,7 @@ WORKDIR /build
 
 RUN git clone --depth 1 --recurse-submodules --shallow-submodules \
       https://github.com/edo9300/ygopro-core.git /build/ygopro-core \
+    && sed -i "s/, 'backend_startup_project=ocgcore'//" /build/ygopro-core/meson.build \
     && meson setup /build/ygopro-core/build /build/ygopro-core \
       -Ddefault_library=shared -Dbuildtype=release \
     && meson compile -C /build/ygopro-core/build
