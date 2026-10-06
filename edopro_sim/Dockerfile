@@ -1,20 +1,48 @@
 FROM python:3.12-slim AS engine-build
 
+ARG OCGCORE_REF=38d04c9feb1a26617407091380634c87262fe3f8
+ARG CARDSCRIPTS_REF=37f270dc813a12d123707ae255f2bda7922999c4
+ARG BABELCDB_REF=fdf92aea31033cd6c44afa89987c5e00665205e2
+
 RUN apt-get update && apt-get install -y --no-install-recommends \
     git g++ meson ninja-build ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /build
 
-RUN git clone --depth 1 --recurse-submodules --shallow-submodules \
-      https://github.com/edo9300/ygopro-core.git /build/ygopro-core \
-    && sed -i "s/, 'backend_startup_project=ocgcore'//" /build/ygopro-core/meson.build \
-    && meson setup /build/ygopro-core/build /build/ygopro-core \
-      -Ddefault_library=shared -Dbuildtype=release \
-    && meson compile -C /build/ygopro-core/build
+RUN mkdir -p /build/ygopro-core \
+    && cd /build/ygopro-core \
+    && git init --quiet \
+    && git remote add origin https://github.com/edo9300/ygopro-core.git \
+    && git fetch --depth 1 origin "${OCGCORE_REF}" \
+    && git checkout --quiet FETCH_HEAD \
+    && git submodule update --init --recursive --depth 1 \
+    && sed -i "s/, 'backend_startup_project=ocgcore'//" meson.build \
+    && meson setup build . -Ddefault_library=shared -Dbuildtype=release \
+    && meson compile -C build
 
-RUN git clone --depth 1 https://github.com/ProjectIgnis/CardScripts.git /build/CardScripts \
-    && git clone --depth 1 https://github.com/ProjectIgnis/BabelCDB.git /build/BabelCDB
+RUN mkdir -p /build/CardScripts \
+    && cd /build/CardScripts \
+    && git init --quiet \
+    && git remote add origin https://github.com/ProjectIgnis/CardScripts.git \
+    && git fetch --depth 1 origin "${CARDSCRIPTS_REF}" \
+    && git checkout --quiet FETCH_HEAD
+
+RUN mkdir -p /build/BabelCDB \
+    && cd /build/BabelCDB \
+    && git init --quiet \
+    && git remote add origin https://github.com/ProjectIgnis/BabelCDB.git \
+    && git fetch --depth 1 origin "${BABELCDB_REF}" \
+    && git checkout --quiet FETCH_HEAD
+
+RUN printf '%s\n' \
+    '{' \
+    '  "bridge_version": "0.4.0",' \
+    '  "rules_profile": "OCG Master Rule 5",' \
+    '  "ocgcore_ref": "'"${OCGCORE_REF}"'",' \
+    '  "cardscripts_ref": "'"${CARDSCRIPTS_REF}"'",' \
+    '  "babelcdb_ref": "'"${BABELCDB_REF}"'"' \
+    '}' > /build/runtime-fingerprint.json
 
 FROM python:3.12-slim
 
@@ -33,6 +61,7 @@ RUN mkdir -p /opt/edopro-sim/lib /opt/edopro-sim/CardScripts /opt/edopro-sim/Bab
 COPY --from=engine-build /build/ygopro-core/build/libocgcore.so /opt/edopro-sim/lib/libocgcore.so
 COPY --from=engine-build /build/CardScripts /opt/edopro-sim/CardScripts
 COPY --from=engine-build /build/BabelCDB/cards.cdb /opt/edopro-sim/BabelCDB/cards.cdb
+COPY --from=engine-build /build/runtime-fingerprint.json /opt/edopro-sim/runtime-fingerprint.json
 COPY server.py /app/server.py
 
 EXPOSE 10000
