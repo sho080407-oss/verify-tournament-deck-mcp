@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import ctypes as C
 import os
 import random
@@ -10,8 +11,9 @@ from pathlib import Path
 from typing import Any
 
 from mcp.server.mcpserver import MCPServer
+from starlette.applications import Starlette
 from starlette.responses import JSONResponse
-from starlette.routing import Route
+from starlette.routing import Mount, Route
 
 ROOT = Path(os.environ.get("EDOPRO_SIM_ROOT", "/opt/edopro-sim"))
 LIB_PATH = ROOT / "lib" / "libocgcore.so"
@@ -1061,10 +1063,22 @@ async def health(_request):
         return JSONResponse({"ok": False, "error": str(exc)}, status_code=503)
 
 
-app = mcp.streamable_http_app(
+mcp_app = mcp.streamable_http_app(
     streamable_http_path="/mcp",
     stateless_http=True,
     json_response=True,
     host="0.0.0.0",
-    custom_starlette_routes=[Route("/healthz", health, methods=["GET"])],
+)
+
+@contextlib.asynccontextmanager
+async def lifespan(_app: Starlette):
+    async with mcp.session_manager.run():
+        yield
+
+app = Starlette(
+    routes=[
+        Route("/healthz", health, methods=["GET"]),
+        Mount("/", app=mcp_app),
+    ],
+    lifespan=lifespan,
 )
