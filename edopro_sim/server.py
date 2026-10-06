@@ -335,6 +335,9 @@ class DuelBridge:
         main: list[int],
         extra: list[int],
         opening_hand: list[int] | None = None,
+        opponent_main: list[int] | None = None,
+        opponent_extra: list[int] | None = None,
+        opponent_opening_hand: list[int] | None = None,
         seed: int = 1,
     ):
         self.core = core
@@ -342,6 +345,9 @@ class DuelBridge:
         self.main = [int(x) for x in main]
         self.extra = [int(x) for x in extra]
         self.opening_hand = [int(x) for x in (opening_hand or [])]
+        self.opponent_main = [int(x) for x in (opponent_main or [DUMMY_OPPONENT] * 40)]
+        self.opponent_extra = [int(x) for x in (opponent_extra or [])]
+        self.opponent_opening_hand = [int(x) for x in (opponent_opening_hand or [])]
         self.seed = int(seed)
         self.duel = C.c_void_p(0)
         self.keepalive: list[Any] = []
@@ -455,7 +461,12 @@ class DuelBridge:
 
     def _setup(self):
         self._load_deck(0, self.main, self.extra, self.opening_hand or None)
-        self._load_deck(1, [DUMMY_OPPONENT] * 10, [], None)
+        self._load_deck(
+            1,
+            self.opponent_main,
+            self.opponent_extra,
+            self.opponent_opening_hand or None,
+        )
         self.core.lib.OCG_StartDuel(self.duel)
 
     def close(self):
@@ -486,16 +497,23 @@ class DuelBridge:
                     messages.append((body[0], body[1:]))
         return status, messages
 
-    def counts(self) -> dict[str, int]:
+    def counts(self, player: int = 0) -> dict[str, int]:
         query = self.core.lib.OCG_DuelQueryCount
+        player = int(player)
         return {
-            "deck": int(query(self.duel, 0, LOCATION_DECK)),
-            "hand": int(query(self.duel, 0, LOCATION_HAND)),
-            "monster_zone": int(query(self.duel, 0, LOCATION_MZONE)),
-            "spell_trap_zone": int(query(self.duel, 0, LOCATION_SZONE)),
-            "graveyard": int(query(self.duel, 0, LOCATION_GRAVE)),
-            "banished": int(query(self.duel, 0, LOCATION_REMOVED)),
-            "extra": int(query(self.duel, 0, LOCATION_EXTRA)),
+            "deck": int(query(self.duel, player, LOCATION_DECK)),
+            "hand": int(query(self.duel, player, LOCATION_HAND)),
+            "monster_zone": int(query(self.duel, player, LOCATION_MZONE)),
+            "spell_trap_zone": int(query(self.duel, player, LOCATION_SZONE)),
+            "graveyard": int(query(self.duel, player, LOCATION_GRAVE)),
+            "banished": int(query(self.duel, player, LOCATION_REMOVED)),
+            "extra": int(query(self.duel, player, LOCATION_EXTRA)),
+        }
+
+    def snapshot(self) -> dict[str, Any]:
+        return {
+            "player": self.counts(0),
+            "opponent": self.counts(1),
         }
 
     def parse_branch(self, mtype: int, payload: bytes) -> dict[str, Any] | None:
@@ -843,6 +861,284 @@ class DuelBridge:
         }
 
 
+    def _public_options(self, branch: dict[str, Any]) -> list[dict[str, Any]]:
+        return [
+            {key: value for key, value in option.items() if not key.startswith("_")}
+            for option in branch.get("options", [])
+        ]
+
+    def _choose_opponent_option(
+        self,
+        branch: dict[str, Any],
+        handtrap_priority: list[int],
+        target_priority: list[int],
+    ) -> int:
+        options = branch.get("options", [])
+        message = str(branch.get("message", ""))
+        if not options:
+            return 0
+
+        if message == "MSG_SELECT_CHAIN":
+            for wanted in handtrap_priority:
+                for index, option in enumerate(options):
+                    if option.get("kind") == "chain" and int(option.get("code", 0)) == wanted:
+                        return index
+            for index, option in enumerate(options):
+                if option.get("kind") == "decline":
+                    return index
+            return 0
+
+        if message in {"MSG_SELECT_EFFECTYN", "MSG_SELECT_YESNO"}:
+            for index, option in enumerate(options):
+                if option.get("kind") == "yes":
+                    return index
+
+        if message == "MSG_SELECT_CARD":
+            for wanted in target_priority:
+                for index, option in enumerate(options):
+                    if int(option.get("code", 0)) == wanted:
+                        return index
+            return 0
+
+        if message == "MSG_SELECT_IDLECMD":
+            for index, option in enumerate(options):
+                if option.get("kind") == "end":
+                    return index
+            return 0
+
+        return 0
+
+    def _choose_candidate_option(self, branch: dict[str, Any]) -> int:
+        options = branch.get("options", [])
+        message = str(branch.get("message", ""))
+        if not options:
+            return 0
+
+        if message == "MSG_SELECT_IDLECMD":
+            priority = {
+                "activate": 0,
+                "spsummon": 1,
+                "summon": 2,
+                "repos": 3,
+                "mset": 4,
+                "set": 5,
+                "battle": 8,
+                "end": 9,
+            }
+            return min(
+                range(len(options)),
+                key=lambda index: (
+                    priority.get(str(options[index].get("kind", "")), 7),
+                    index,
+                ),
+            )
+
+        if message == "MSG_SELECT_CHAIN":
+            for index, option in enumerate(options):
+                if option.get("kind") == "chain":
+                    return index
+            for index, option in enumerate(options):
+                if option.get("kind") == "decline":
+                    return index
+
+        if message in {"MSG_SELECT_EFFECTYN", "MSG_SELECT_YESNO"}:
+            for index, option in enumerate(options):
+                if option.get("kind") == "yes":
+                    return index
+
+        return 0
+
+    def replay_policy(
+        self,
+        player_choices: list[int] | None = None,
+        *,
+        opponent_handtrap_codes: list[int] | None = None,
+        opponent_target_priority: list[int] | None = None,
+        auto_player: bool = False,
+        max_player_decisions: int = 80,
+        max_process_steps: int = 1200,
+    ) -> dict[str, Any]:
+        player_choices = [int(value) for value in (player_choices or [])]
+        handtrap_priority = [int(value) for value in (opponent_handtrap_codes or [])]
+        target_priority = [int(value) for value in (opponent_target_priority or [])]
+        choice_cursor = 0
+        candidate_decisions = 0
+        action_trace: list[dict[str, Any]] = []
+        handtraps_used: list[dict[str, Any]] = []
+        last_messages: list[str] = []
+
+        for step in range(max_process_steps):
+            status, messages = self.process_once()
+            last_messages = [
+                MSG_NAMES.get(message_type, f"MSG_{message_type}")
+                for message_type, _ in messages[-12:]
+            ]
+            if any(message_type == MSG_RETRY for message_type, _ in messages):
+                return {
+                    "status": "retry_error",
+                    "process_step": step,
+                    "choices_consumed": choice_cursor,
+                    "trace": action_trace,
+                    "handtraps_used": handtraps_used,
+                    "last_messages": last_messages,
+                    "counts": self.counts(0),
+                    "opponent_counts": self.counts(1),
+                    "errors": self.errors[-20:],
+                }
+            if status == OCG_DUEL_STATUS_END:
+                return {
+                    "status": "duel_end",
+                    "process_step": step,
+                    "choices_consumed": choice_cursor,
+                    "trace": action_trace,
+                    "handtraps_used": handtraps_used,
+                    "last_messages": last_messages,
+                    "counts": self.counts(0),
+                    "opponent_counts": self.counts(1),
+                    "errors": self.errors[-20:],
+                }
+            if status != OCG_DUEL_STATUS_AWAITING:
+                continue
+            if not messages:
+                return {
+                    "status": "awaiting_without_message",
+                    "process_step": step,
+                    "choices_consumed": choice_cursor,
+                    "trace": action_trace,
+                    "handtraps_used": handtraps_used,
+                    "counts": self.counts(0),
+                    "opponent_counts": self.counts(1),
+                    "errors": self.errors[-20:],
+                }
+
+            message_type, payload = messages[-1]
+            branch = self.parse_branch(message_type, payload)
+            if branch and branch.get("options"):
+                player = int(branch.get("player", 0))
+                options = branch["options"]
+
+                if player == 1:
+                    selected = self._choose_opponent_option(
+                        branch,
+                        handtrap_priority,
+                        target_priority,
+                    )
+                    selected = max(0, min(int(selected), len(options) - 1))
+                    option = options[selected]
+                    trace_row = {
+                        "player": 1,
+                        "message": branch.get("message"),
+                        "option_index": selected,
+                        "kind": option.get("kind"),
+                        "label": option.get("label"),
+                        "code": int(option.get("code", 0)),
+                    }
+                    action_trace.append(trace_row)
+                    if (
+                        option.get("kind") == "chain"
+                        and int(option.get("code", 0)) in handtrap_priority
+                    ):
+                        handtraps_used.append(trace_row)
+                    self.set_response(bytes.fromhex(option["_response_hex"]))
+                    continue
+
+                if candidate_decisions >= max_player_decisions:
+                    return {
+                        "status": "player_decision_budget_exhausted",
+                        "process_step": step,
+                        "choices_consumed": choice_cursor,
+                        "trace": action_trace,
+                        "handtraps_used": handtraps_used,
+                        "decision": {
+                            "message": branch["message"],
+                            "player": player,
+                            "options": self._public_options(branch),
+                        },
+                        "counts": self.counts(0),
+                        "opponent_counts": self.counts(1),
+                        "errors": self.errors[-20:],
+                    }
+
+                if choice_cursor < len(player_choices):
+                    selected = int(player_choices[choice_cursor])
+                    choice_cursor += 1
+                elif auto_player:
+                    selected = self._choose_candidate_option(branch)
+                else:
+                    return {
+                        "status": "awaiting_choice",
+                        "process_step": step,
+                        "choices_consumed": choice_cursor,
+                        "trace": action_trace,
+                        "handtraps_used": handtraps_used,
+                        "decision": {
+                            "message": branch["message"],
+                            "player": player,
+                            "options": self._public_options(branch),
+                        },
+                        "last_messages": last_messages,
+                        "counts": self.counts(0),
+                        "opponent_counts": self.counts(1),
+                        "errors": self.errors[-20:],
+                    }
+
+                if selected < 0 or selected >= len(options):
+                    return {
+                        "status": "invalid_choice",
+                        "process_step": step,
+                        "choices_consumed": choice_cursor,
+                        "provided_choice": selected,
+                        "available_count": len(options),
+                        "trace": action_trace,
+                        "counts": self.counts(0),
+                        "opponent_counts": self.counts(1),
+                    }
+
+                option = options[selected]
+                action_trace.append(
+                    {
+                        "player": 0,
+                        "message": branch.get("message"),
+                        "option_index": selected,
+                        "kind": option.get("kind"),
+                        "label": option.get("label"),
+                        "code": int(option.get("code", 0)),
+                    }
+                )
+                candidate_decisions += 1
+                self.set_response(bytes.fromhex(option["_response_hex"]))
+                continue
+
+            automatic = self.default_response(message_type, payload)
+            if automatic is None:
+                return {
+                    "status": "unsupported_prompt",
+                    "process_step": step,
+                    "choices_consumed": choice_cursor,
+                    "trace": action_trace,
+                    "handtraps_used": handtraps_used,
+                    "message": MSG_NAMES.get(message_type, f"MSG_{message_type}"),
+                    "raw_payload_hex": payload.hex(),
+                    "last_messages": last_messages,
+                    "counts": self.counts(0),
+                    "opponent_counts": self.counts(1),
+                    "errors": self.errors[-20:],
+                }
+            self.set_response(automatic)
+
+        return {
+            "status": "process_budget_exhausted",
+            "process_steps": max_process_steps,
+            "choices_consumed": choice_cursor,
+            "trace": action_trace,
+            "handtraps_used": handtraps_used,
+            "last_messages": last_messages,
+            "counts": self.counts(0),
+            "opponent_counts": self.counts(1),
+            "errors": self.errors[-20:],
+        }
+
+
 _core_singleton: Core | None = None
 _db_singleton: CardDB | None = None
 
@@ -899,17 +1195,251 @@ def validate_input_deck(
     }
 
 
+def build_handtrap_opponent(
+    handtrap_codes: list[int] | None,
+) -> tuple[list[int], list[int]]:
+    requested = clean_codes(handtrap_codes)
+    opening = requested[:5]
+    while len(opening) < 5:
+        opening.append(DUMMY_OPPONENT)
+    main = list(opening)
+    while len(main) < 40:
+        main.append(DUMMY_OPPONENT)
+    return main, opening
+
+
+def route_goal_reached(
+    result: dict[str, Any],
+    *,
+    min_monsters: int = 0,
+    min_backrow: int = 0,
+    min_hand: int = 0,
+) -> bool:
+    counts = result.get("counts", {})
+    return (
+        int(counts.get("monster_zone", 0)) >= int(min_monsters)
+        and int(counts.get("spell_trap_zone", 0)) >= int(min_backrow)
+        and int(counts.get("hand", 0)) >= int(min_hand)
+    )
+
+
+def route_score(
+    result: dict[str, Any],
+    *,
+    min_monsters: int = 0,
+    min_backrow: int = 0,
+    min_hand: int = 0,
+) -> float:
+    counts = result.get("counts", {})
+    opponent = result.get("opponent_counts", {})
+    score = (
+        12.0 * int(counts.get("monster_zone", 0))
+        + 7.0 * int(counts.get("spell_trap_zone", 0))
+        + 1.25 * int(counts.get("hand", 0))
+        + 0.25 * int(counts.get("graveyard", 0))
+        - 2.0 * int(opponent.get("monster_zone", 0))
+        - 1.0 * int(opponent.get("spell_trap_zone", 0))
+    )
+    if route_goal_reached(
+        result,
+        min_monsters=min_monsters,
+        min_backrow=min_backrow,
+        min_hand=min_hand,
+    ):
+        score += 1000.0
+    if result.get("status") in {"retry_error", "invalid_choice", "unsupported_prompt"}:
+        score -= 500.0
+    score -= 0.05 * len(result.get("trace", []))
+    return round(score, 3)
+
+
+def run_policy_once(
+    main: list[int],
+    extra: list[int],
+    opening_hand: list[int] | None,
+    player_choices: list[int] | None,
+    handtrap_codes: list[int] | None,
+    opponent_target_priority: list[int] | None,
+    *,
+    seed: int,
+    auto_player: bool,
+    max_player_decisions: int,
+    max_process_steps: int,
+) -> dict[str, Any]:
+    opponent_main, opponent_opening = build_handtrap_opponent(handtrap_codes)
+    duel = DuelBridge(
+        get_core(),
+        get_db(),
+        main,
+        extra,
+        opening_hand or None,
+        opponent_main=opponent_main,
+        opponent_extra=[],
+        opponent_opening_hand=opponent_opening,
+        seed=int(seed),
+    )
+    try:
+        result = duel.replay_policy(
+            player_choices,
+            opponent_handtrap_codes=handtrap_codes,
+            opponent_target_priority=opponent_target_priority,
+            auto_player=auto_player,
+            max_player_decisions=max_player_decisions,
+            max_process_steps=max_process_steps,
+        )
+        result["opponent_opening_hand"] = [
+            {"code": code, "name": get_db().name(code)}
+            for code in opponent_opening
+        ]
+        return result
+    finally:
+        duel.close()
+
+
+def search_combo_routes_impl(
+    main: list[int],
+    extra: list[int],
+    opening_hand: list[int] | None,
+    handtrap_codes: list[int] | None,
+    opponent_target_priority: list[int] | None,
+    *,
+    seed: int,
+    max_depth: int,
+    beam_width: int,
+    branch_limit: int,
+    max_nodes: int,
+    min_monsters: int,
+    min_backrow: int,
+    min_hand: int,
+) -> dict[str, Any]:
+    frontier: list[list[int]] = [[]]
+    evaluated: list[dict[str, Any]] = []
+    visited: set[tuple[int, ...]] = set()
+    nodes = 0
+
+    max_depth = max(1, min(int(max_depth), 12))
+    beam_width = max(1, min(int(beam_width), 12))
+    branch_limit = max(1, min(int(branch_limit), 12))
+    max_nodes = max(4, min(int(max_nodes), 240))
+
+    for depth in range(max_depth + 1):
+        layer: list[dict[str, Any]] = []
+        for path in frontier:
+            key = tuple(path)
+            if key in visited:
+                continue
+            visited.add(key)
+            result = run_policy_once(
+                main,
+                extra,
+                opening_hand,
+                path,
+                handtrap_codes,
+                opponent_target_priority,
+                seed=seed,
+                auto_player=False,
+                max_player_decisions=max_depth + 8,
+                max_process_steps=1600,
+            )
+            nodes += 1
+            row = {
+                "choices": path,
+                "depth": len(path),
+                "score": route_score(
+                    result,
+                    min_monsters=min_monsters,
+                    min_backrow=min_backrow,
+                    min_hand=min_hand,
+                ),
+                "goal_reached": route_goal_reached(
+                    result,
+                    min_monsters=min_monsters,
+                    min_backrow=min_backrow,
+                    min_hand=min_hand,
+                ),
+                "result": result,
+            }
+            evaluated.append(row)
+            layer.append(row)
+            if nodes >= max_nodes:
+                break
+
+        if nodes >= max_nodes or depth >= max_depth:
+            break
+
+        layer.sort(key=lambda row: (bool(row["goal_reached"]), float(row["score"])), reverse=True)
+        parents = layer[:beam_width]
+        next_frontier: list[list[int]] = []
+        for row in parents:
+            result = row["result"]
+            if result.get("status") != "awaiting_choice":
+                continue
+            options = result.get("decision", {}).get("options", [])
+            if not options:
+                continue
+            non_terminal = [
+                (index, option)
+                for index, option in enumerate(options)
+                if option.get("kind") not in {"end", "battle"}
+            ]
+            selected_options = non_terminal or list(enumerate(options))
+            for index, _option in selected_options[:branch_limit]:
+                candidate = [*row["choices"], int(index)]
+                if tuple(candidate) not in visited:
+                    next_frontier.append(candidate)
+
+        if not next_frontier:
+            break
+        frontier = next_frontier[: max(beam_width * branch_limit, beam_width)]
+
+    evaluated.sort(
+        key=lambda row: (bool(row["goal_reached"]), float(row["score"]), row["depth"]),
+        reverse=True,
+    )
+    top = []
+    for row in evaluated[:5]:
+        result = row["result"]
+        top.append(
+            {
+                "choices": row["choices"],
+                "depth": row["depth"],
+                "score": row["score"],
+                "goal_reached": row["goal_reached"],
+                "status": result.get("status"),
+                "trace": result.get("trace", []),
+                "handtraps_used": result.get("handtraps_used", []),
+                "counts": result.get("counts", {}),
+                "opponent_counts": result.get("opponent_counts", {}),
+                "next_decision": result.get("decision"),
+                "errors": result.get("errors", []),
+            }
+        )
+    return {
+        "nodes_evaluated": nodes,
+        "max_nodes": max_nodes,
+        "max_depth": max_depth,
+        "beam_width": beam_width,
+        "branch_limit": branch_limit,
+        "goal": {
+            "min_monsters": int(min_monsters),
+            "min_backrow": int(min_backrow),
+            "min_hand": int(min_hand),
+        },
+        "top_routes": top,
+    }
+
+
 mcp = MCPServer("verify-tournament-deck-edopro-sim")
 
 
 @mcp.tool()
 def edopro_engine_status() -> dict[str, Any]:
-    """Report the installed ocgcore/CardScripts/BabelCDB runtime and v0.2 capability matrix."""
+    """Report the installed ocgcore/CardScripts/BabelCDB runtime and v0.3 capability matrix."""
     core = get_core()
     major, minor = core.version()
     return {
         "ok": True,
-        "bridge_version": "0.2.0",
+        "bridge_version": "0.3.0",
         "ocgcore_version": f"{major}.{minor}",
         "paths": {
             "library": str(LIB_PATH),
@@ -925,8 +1455,9 @@ def edopro_engine_status() -> dict[str, Any]:
             "opening_hand_sampling": True,
             "deterministic_choice_replay": True,
             "fixed_opening_hand_replay": True,
-            "autonomous_combo_search": False,
-            "autonomous_handtrap_adversary": False,
+            "heuristic_combo_route_search": True,
+            "autonomous_handtrap_adversary": True,
+            "batch_handtrap_stress": True,
             "autonomous_full_match_bot": False,
         },
     }
@@ -942,7 +1473,7 @@ def edopro_export_ydk(
     main_codes = clean_codes(main)
     extra_codes = clean_codes(extra)
     side_codes = clean_codes(side)
-    lines = ["#created by Verify Tournament Deck v0.2.0", "#main"]
+    lines = ["#created by Verify Tournament Deck v0.3.0", "#main"]
     lines.extend(str(code) for code in main_codes)
     lines.append("#extra")
     lines.extend(str(code) for code in extra_codes)
@@ -1046,6 +1577,237 @@ def edopro_replay_choices(
         duel.close()
 
 
+@mcp.tool()
+def edopro_handtrap_stress(
+    main: list[int],
+    extra: list[int] | None = None,
+    opening_hand: list[int] | None = None,
+    handtrap_codes: list[int] | None = None,
+    player_choices: list[int] | None = None,
+    opponent_target_priority: list[int] | None = None,
+    auto_player: bool = False,
+    seed: int = 1,
+    max_player_decisions: int = 80,
+    max_process_steps: int = 1200,
+) -> dict[str, Any]:
+    """Run a real-ocgcore line while the opponent automatically fires supplied hand traps at the first legal timing.
+
+    Supply handtrap_codes as card passcodes. The bridge fixes up to five supplied
+    cards into the opponent opening hand and fills the rest with inert test cards.
+    This is a deterministic stress scenario, not a tournament-legal opponent deck.
+    """
+    main_codes = clean_codes(main)
+    extra_codes = clean_codes(extra)
+    hand_codes = clean_codes(opening_hand)
+    traps = clean_codes(handtrap_codes)
+    validation = validate_input_deck(main_codes, extra_codes)
+    if not validation["ok_for_simulation"]:
+        return {"status": "invalid_deck", "validation": validation}
+    if hand_codes and len(hand_codes) != 5:
+        return {
+            "status": "invalid_opening_hand",
+            "reason": "opening_hand must contain exactly 5 card passcodes when supplied",
+        }
+    missing_traps = [code for code in traps if not get_db().exists(code)]
+    if missing_traps:
+        return {
+            "status": "invalid_handtrap_codes",
+            "missing_codes": sorted(set(missing_traps)),
+        }
+    result = run_policy_once(
+        main_codes,
+        extra_codes,
+        hand_codes or None,
+        clean_codes(player_choices),
+        traps,
+        clean_codes(opponent_target_priority),
+        seed=int(seed),
+        auto_player=bool(auto_player),
+        max_player_decisions=max(1, min(int(max_player_decisions), 200)),
+        max_process_steps=max(50, min(int(max_process_steps), 5000)),
+    )
+    result["validation"] = validation
+    result["rules_profile"] = "OCG Master Rule 5"
+    result["handtrap_policy"] = "first legal activation by supplied priority"
+    return result
+
+
+@mcp.tool()
+def edopro_search_combo_routes(
+    main: list[int],
+    extra: list[int] | None = None,
+    opening_hand: list[int] | None = None,
+    handtrap_codes: list[int] | None = None,
+    opponent_target_priority: list[int] | None = None,
+    seed: int = 1,
+    max_depth: int = 6,
+    beam_width: int = 4,
+    branch_limit: int = 6,
+    max_nodes: int = 120,
+    min_monsters: int = 0,
+    min_backrow: int = 0,
+    min_hand: int = 0,
+) -> dict[str, Any]:
+    """Bounded beam-search over candidate choices with automatic opponent hand traps.
+
+    This searches real ocgcore decision branches and ranks routes with a transparent
+    board-presence heuristic. It is useful for finding candidate penetration routes,
+    but it is not a proof of globally optimal Yu-Gi-Oh! play.
+    """
+    main_codes = clean_codes(main)
+    extra_codes = clean_codes(extra)
+    hand_codes = clean_codes(opening_hand)
+    traps = clean_codes(handtrap_codes)
+    validation = validate_input_deck(main_codes, extra_codes)
+    if not validation["ok_for_simulation"]:
+        return {"status": "invalid_deck", "validation": validation}
+    if hand_codes and len(hand_codes) != 5:
+        return {
+            "status": "invalid_opening_hand",
+            "reason": "opening_hand must contain exactly 5 card passcodes when supplied",
+        }
+    missing_traps = [code for code in traps if not get_db().exists(code)]
+    if missing_traps:
+        return {
+            "status": "invalid_handtrap_codes",
+            "missing_codes": sorted(set(missing_traps)),
+        }
+
+    result = search_combo_routes_impl(
+        main_codes,
+        extra_codes,
+        hand_codes or None,
+        traps,
+        clean_codes(opponent_target_priority),
+        seed=int(seed),
+        max_depth=max_depth,
+        beam_width=beam_width,
+        branch_limit=branch_limit,
+        max_nodes=max_nodes,
+        min_monsters=max(0, int(min_monsters)),
+        min_backrow=max(0, int(min_backrow)),
+        min_hand=max(0, int(min_hand)),
+    )
+    result["validation"] = validation
+    result["rules_profile"] = "OCG Master Rule 5"
+    result["handtrap_policy"] = "first legal activation by supplied priority"
+    result["optimality"] = "bounded heuristic search; not global-optimality proof"
+    return result
+
+
+@mcp.tool()
+def edopro_batch_stress(
+    main: list[int],
+    extra: list[int] | None = None,
+    handtrap_codes: list[int] | None = None,
+    opponent_target_priority: list[int] | None = None,
+    trials: int = 20,
+    seed: int = 1,
+    min_monsters: int = 1,
+    min_backrow: int = 0,
+    min_hand: int = 0,
+    max_player_decisions: int = 60,
+    max_process_steps: int = 1200,
+) -> dict[str, Any]:
+    """Run multiple automatic ocgcore stress games with sampled five-card openings.
+
+    Candidate play uses the v0.3 greedy legal-action policy; the opponent uses
+    supplied hand traps at their first legal timing. The reported pass rate is a
+    stress-test success rate against the requested board thresholds, not a match win rate.
+    """
+    main_codes = clean_codes(main)
+    extra_codes = clean_codes(extra)
+    traps = clean_codes(handtrap_codes)
+    validation = validate_input_deck(main_codes, extra_codes)
+    if not validation["ok_for_simulation"]:
+        return {"status": "invalid_deck", "validation": validation}
+    if len(main_codes) < 5:
+        return {"status": "invalid_deck", "reason": "main deck needs at least 5 cards"}
+    missing_traps = [code for code in traps if not get_db().exists(code)]
+    if missing_traps:
+        return {
+            "status": "invalid_handtrap_codes",
+            "missing_codes": sorted(set(missing_traps)),
+        }
+
+    trials = max(1, min(int(trials), 50))
+    rng = random.Random(int(seed))
+    statuses: Counter[str] = Counter()
+    passes = 0
+    handtrap_usage: Counter[int] = Counter()
+    samples: list[dict[str, Any]] = []
+
+    for index in range(trials):
+        opening = rng.sample(main_codes, 5)
+        result = run_policy_once(
+            main_codes,
+            extra_codes,
+            opening,
+            None,
+            traps,
+            clean_codes(opponent_target_priority),
+            seed=int(seed) + index,
+            auto_player=True,
+            max_player_decisions=max(1, min(int(max_player_decisions), 160)),
+            max_process_steps=max(50, min(int(max_process_steps), 5000)),
+        )
+        status = str(result.get("status", "unknown"))
+        statuses[status] += 1
+        passed = route_goal_reached(
+            result,
+            min_monsters=max(0, int(min_monsters)),
+            min_backrow=max(0, int(min_backrow)),
+            min_hand=max(0, int(min_hand)),
+        )
+        passes += int(passed)
+        for row in result.get("handtraps_used", []):
+            handtrap_usage[int(row.get("code", 0))] += 1
+        if index < 10:
+            samples.append(
+                {
+                    "trial": index,
+                    "opening_hand": [
+                        {"code": code, "name": get_db().name(code)}
+                        for code in opening
+                    ],
+                    "passed": passed,
+                    "status": status,
+                    "counts": result.get("counts", {}),
+                    "handtraps_used": result.get("handtraps_used", []),
+                    "trace_tail": result.get("trace", [])[-12:],
+                    "errors": result.get("errors", [])[-5:],
+                }
+            )
+
+    return {
+        "trials": trials,
+        "seed": int(seed),
+        "passes": passes,
+        "pass_rate": round(passes / trials, 6),
+        "goal": {
+            "min_monsters": max(0, int(min_monsters)),
+            "min_backrow": max(0, int(min_backrow)),
+            "min_hand": max(0, int(min_hand)),
+        },
+        "statuses": dict(statuses),
+        "handtrap_usage": [
+            {
+                "code": code,
+                "name": get_db().name(code),
+                "activations": count,
+            }
+            for code, count in handtrap_usage.most_common()
+            if code
+        ],
+        "samples": samples,
+        "validation": validation,
+        "rules_profile": "OCG Master Rule 5",
+        "candidate_policy": "greedy legal-action heuristic",
+        "handtrap_policy": "first legal activation by supplied priority",
+        "warning": "This is an automated stress-test pass rate, not a tournament match win rate.",
+    }
+
+
 _selftest_cache: dict[str, Any] | None = None
 
 
@@ -1095,7 +1857,7 @@ async def health(_request):
             {
                 "ok": ok,
                 "service": "verify-tournament-deck-edopro-sim",
-                "version": "0.2.0",
+                "version": "0.3.0",
                 "ocgcore": f"{major}.{minor}",
                 "cards_cdb": CDB_PATH.exists(),
                 "cardscripts": SCRIPTS.exists(),
