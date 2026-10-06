@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import contextlib
 import ctypes as C
+import json
 import os
 import random
 import sqlite3
@@ -19,6 +20,7 @@ ROOT = Path(os.environ.get("EDOPRO_SIM_ROOT", "/opt/edopro-sim"))
 LIB_PATH = ROOT / "lib" / "libocgcore.so"
 SCRIPTS = ROOT / "CardScripts"
 CDB_PATH = ROOT / "BabelCDB" / "cards.cdb"
+FINGERPRINT_PATH = ROOT / "runtime-fingerprint.json"
 
 LOCATION_DECK = 0x01
 LOCATION_HAND = 0x02
@@ -35,6 +37,7 @@ POS_FACEDOWN_DEFENSE = 0x8
 TYPE_LINK = 0x4000000
 
 MSG_RETRY = 1
+MSG_WIN = 5
 MSG_SELECT_BATTLECMD = 10
 MSG_SELECT_IDLECMD = 11
 MSG_SELECT_EFFECTYN = 12
@@ -51,6 +54,11 @@ MSG_SELECT_SUM = 23
 MSG_SELECT_DISFIELD = 24
 MSG_SORT_CARD = 25
 MSG_SELECT_UNSELECT_CARD = 26
+MSG_NEW_TURN = 40
+MSG_NEW_PHASE = 41
+MSG_SUMMONING = 60
+MSG_SPSUMMONING = 62
+MSG_FLIPSUMMONING = 64
 MSG_ROCK_PAPER_SCISSORS = 132
 MSG_ANNOUNCE_RACE = 140
 MSG_ANNOUNCE_ATTRIB = 141
@@ -59,6 +67,7 @@ MSG_ANNOUNCE_NUMBER = 143
 
 MSG_NAMES = {
     MSG_RETRY: "MSG_RETRY",
+    MSG_WIN: "MSG_WIN",
     MSG_SELECT_BATTLECMD: "MSG_SELECT_BATTLECMD",
     MSG_SELECT_IDLECMD: "MSG_SELECT_IDLECMD",
     MSG_SELECT_EFFECTYN: "MSG_SELECT_EFFECTYN",
@@ -75,6 +84,11 @@ MSG_NAMES = {
     MSG_SELECT_DISFIELD: "MSG_SELECT_DISFIELD",
     MSG_SORT_CARD: "MSG_SORT_CARD",
     MSG_SELECT_UNSELECT_CARD: "MSG_SELECT_UNSELECT_CARD",
+    MSG_NEW_TURN: "MSG_NEW_TURN",
+    MSG_NEW_PHASE: "MSG_NEW_PHASE",
+    MSG_SUMMONING: "MSG_SUMMONING",
+    MSG_SPSUMMONING: "MSG_SPSUMMONING",
+    MSG_FLIPSUMMONING: "MSG_FLIPSUMMONING",
     MSG_ROCK_PAPER_SCISSORS: "MSG_ROCK_PAPER_SCISSORS",
     MSG_ANNOUNCE_RACE: "MSG_ANNOUNCE_RACE",
     MSG_ANNOUNCE_ATTRIB: "MSG_ANNOUNCE_ATTRIB",
@@ -109,6 +123,11 @@ IDLE_SSET = 4
 IDLE_ACTIVATE = 5
 IDLE_TO_BP = 6
 IDLE_TO_EP = 7
+
+BATTLE_ACTIVATE = 0
+BATTLE_ATTACK = 1
+BATTLE_TO_M2 = 2
+BATTLE_TO_EP = 3
 
 # Inert opponent deck used only to let ocgcore start a duel.
 DUMMY_OPPONENT = 69247929
@@ -293,6 +312,9 @@ class Reader:
 
     def u8(self) -> int:
         return self._read("<B")
+
+    def u16(self) -> int:
+        return self._read("<H")
 
     def u32(self) -> int:
         return self._read("<I")
@@ -520,6 +542,8 @@ class DuelBridge:
         try:
             if mtype == MSG_SELECT_IDLECMD:
                 return self._parse_idle(payload)
+            if mtype == MSG_SELECT_BATTLECMD:
+                return self._parse_battle(payload)
             if mtype == MSG_SELECT_CHAIN:
                 return self._parse_chain(payload)
             if mtype == MSG_SELECT_OPTION:
@@ -583,6 +607,54 @@ class DuelBridge:
         if can_end:
             options.append(option_dict("end", "End Phase", i32(IDLE_TO_EP)))
         return {"message": "MSG_SELECT_IDLECMD", "player": player, "options": options}
+
+    def _parse_battle(self, payload: bytes) -> dict[str, Any]:
+        reader = Reader(payload)
+        player = reader.u8()
+        options: list[dict[str, Any]] = []
+
+        count = reader.u32()
+        for index in range(count):
+            code = reader.u32()
+            reader.u8()
+            reader.u8()
+            reader.u32()
+            reader.u64()
+            reader.u8()
+            options.append(
+                option_dict(
+                    "battle_activate",
+                    f"Battle Activate: {self.db.name(code)}",
+                    i32((index << 16) | BATTLE_ACTIVATE),
+                    code,
+                )
+            )
+
+        count = reader.u32()
+        for index in range(count):
+            code = reader.u32()
+            reader.u8()
+            reader.u8()
+            reader.u8()
+            reader.u8()
+            options.append(
+                option_dict(
+                    "attack",
+                    f"Attack: {self.db.name(code)}",
+                    i32((index << 16) | BATTLE_ATTACK),
+                    code,
+                )
+            )
+
+        can_m2 = reader.u8()
+        can_ep = reader.u8()
+        if can_m2:
+            options.append(
+                option_dict("main2", "Enter Main Phase 2", i32(BATTLE_TO_M2))
+            )
+        if can_ep:
+            options.append(option_dict("end", "End Phase", i32(BATTLE_TO_EP)))
+        return {"message": "MSG_SELECT_BATTLECMD", "player": player, "options": options}
 
     def _parse_chain(self, payload: bytes) -> dict[str, Any]:
         reader = Reader(payload)
@@ -681,7 +753,7 @@ class DuelBridge:
     def default_response(self, mtype: int, payload: bytes) -> bytes | None:
         try:
             reader = Reader(payload)
-            if mtype == MSG_SELECT_CARD:
+            if mtype in (MSG_SELECT_CARD, MSG_SELECT_TRIBUTE):
                 reader.u8()
                 reader.u8()
                 minimum = reader.u32()
@@ -738,12 +810,44 @@ class DuelBridge:
                 return i32(1)
             if mtype == MSG_ANNOUNCE_NUMBER:
                 return i32(0)
+            if mtype == MSG_SELECT_COUNTER:
+                reader.u8()
+                reader.u16()
+                needed = reader.u16()
+                card_count = reader.u32()
+                available: list[int] = []
+                for _ in range(card_count):
+                    reader.u32()
+                    reader.u8()
+                    reader.u8()
+                    reader.u8()
+                    available.append(reader.u16())
+                remaining = needed
+                chosen: list[int] = []
+                for count in available:
+                    take = min(count, remaining)
+                    chosen.append(take)
+                    remaining -= take
+                if remaining:
+                    return None
+                return b"".join(struct.pack("<h", count) for count in chosen)
+            if mtype in (MSG_ANNOUNCE_RACE, MSG_ANNOUNCE_ATTRIB):
+                reader.u8()
+                count = reader.u8()
+                available = reader.u64() if mtype == MSG_ANNOUNCE_RACE else reader.u32()
+                selected = 0
+                for bit in range(64 if mtype == MSG_ANNOUNCE_RACE else 32):
+                    mask = 1 << bit
+                    if available & mask:
+                        selected |= mask
+                        count -= 1
+                        if count <= 0:
+                            break
+                if count > 0:
+                    return None
+                return struct.pack("<Q" if mtype == MSG_ANNOUNCE_RACE else "<I", selected)
             if mtype in (
-                MSG_SELECT_TRIBUTE,
-                MSG_SELECT_COUNTER,
                 MSG_SELECT_SUM,
-                MSG_ANNOUNCE_RACE,
-                MSG_ANNOUNCE_ATTRIB,
                 MSG_ANNOUNCE_CARD,
             ):
                 return None
@@ -947,6 +1051,341 @@ class DuelBridge:
                     return index
 
         return 0
+
+    def _choose_autoplay_option(
+        self,
+        branch: dict[str, Any],
+        *,
+        profile: str,
+        reaction_priority: list[int],
+        target_priority: list[int],
+        reaction_hold_windows: dict[int, int],
+        reaction_min_opponent_summons: dict[int, int],
+        reaction_windows_seen: Counter[int],
+        summons_this_turn: list[int],
+    ) -> int:
+        options = branch.get("options", [])
+        message = str(branch.get("message", ""))
+        player = int(branch.get("player", 0))
+        if not options:
+            return 0
+
+        if message == "MSG_SELECT_CHAIN":
+            decline_index = next(
+                (index for index, option in enumerate(options) if option.get("kind") == "decline"),
+                None,
+            )
+            for wanted in reaction_priority:
+                for index, option in enumerate(options):
+                    if option.get("kind") != "chain" or int(option.get("code", 0)) != wanted:
+                        continue
+                    reaction_windows_seen[wanted] += 1
+                    hold = max(0, int(reaction_hold_windows.get(wanted, 0)))
+                    min_summons = max(
+                        0,
+                        int(reaction_min_opponent_summons.get(wanted, 0)),
+                    )
+                    opponent = 1 - player
+                    if (
+                        reaction_windows_seen[wanted] > hold
+                        and summons_this_turn[opponent] >= min_summons
+                    ):
+                        return index
+
+            non_reaction = [
+                (index, option)
+                for index, option in enumerate(options)
+                if option.get("kind") == "chain"
+                and int(option.get("code", 0)) not in set(reaction_priority)
+            ]
+            if non_reaction and profile != "passive":
+                return non_reaction[0][0]
+            if decline_index is not None:
+                return decline_index
+            return 0
+
+        if message == "MSG_SELECT_IDLECMD":
+            if profile == "control":
+                order = {
+                    "activate": 0,
+                    "set": 1,
+                    "mset": 2,
+                    "spsummon": 3,
+                    "summon": 4,
+                    "repos": 5,
+                    "battle": 7,
+                    "end": 8,
+                }
+            elif profile == "aggressive":
+                order = {
+                    "activate": 0,
+                    "spsummon": 1,
+                    "summon": 2,
+                    "battle": 3,
+                    "repos": 4,
+                    "set": 5,
+                    "mset": 6,
+                    "end": 9,
+                }
+            elif profile == "passive":
+                order = {
+                    "end": 0,
+                    "set": 1,
+                    "mset": 2,
+                    "repos": 3,
+                    "summon": 7,
+                    "spsummon": 8,
+                    "activate": 9,
+                    "battle": 9,
+                }
+            else:
+                order = {
+                    "activate": 0,
+                    "spsummon": 1,
+                    "summon": 2,
+                    "set": 3,
+                    "mset": 4,
+                    "repos": 5,
+                    "battle": 7,
+                    "end": 8,
+                }
+            return min(
+                range(len(options)),
+                key=lambda index: (
+                    order.get(str(options[index].get("kind", "")), 6),
+                    index,
+                ),
+            )
+
+        if message == "MSG_SELECT_BATTLECMD":
+            order = {
+                "battle_activate": 0,
+                "attack": 1,
+                "main2": 2,
+                "end": 3,
+            }
+            return min(
+                range(len(options)),
+                key=lambda index: (
+                    order.get(str(options[index].get("kind", "")), 4),
+                    index,
+                ),
+            )
+
+        if message in {"MSG_SELECT_EFFECTYN", "MSG_SELECT_YESNO"}:
+            for index, option in enumerate(options):
+                if option.get("kind") == "yes":
+                    return index
+
+        if message == "MSG_SELECT_CARD":
+            for wanted in target_priority:
+                for index, option in enumerate(options):
+                    if int(option.get("code", 0)) == wanted:
+                        return index
+
+        if message == "MSG_SELECT_POSITION":
+            for index, option in enumerate(options):
+                if option.get("label") == "Face-up Attack":
+                    return index
+
+        return 0
+
+    def autoplay(
+        self,
+        *,
+        profiles: tuple[str, str] = ("balanced", "balanced"),
+        reaction_priorities: tuple[list[int], list[int]] = ([], []),
+        target_priorities: tuple[list[int], list[int]] = ([], []),
+        reaction_hold_windows: tuple[dict[int, int], dict[int, int]] = ({}, {}),
+        reaction_min_opponent_summons: tuple[dict[int, int], dict[int, int]] = ({}, {}),
+        max_decisions: int = 600,
+        max_process_steps: int = 6000,
+        stop_after_turns: int = 0,
+    ) -> dict[str, Any]:
+        profiles = tuple(
+            profile if profile in {"balanced", "aggressive", "control", "passive"}
+            else "balanced"
+            for profile in profiles
+        )
+        action_trace: list[dict[str, Any]] = []
+        reaction_windows_seen = (Counter(), Counter())
+        summons_this_turn = [0, 0]
+        turn_count = 0
+        turn_player: int | None = None
+        phase: int | None = None
+        winner: int | None = None
+        win_reason: int | None = None
+        decisions = 0
+        last_messages: list[str] = []
+
+        for step in range(max_process_steps):
+            status, messages = self.process_once()
+            last_messages = [
+                MSG_NAMES.get(message_type, f"MSG_{message_type}")
+                for message_type, _ in messages[-12:]
+            ]
+
+            for message_type, payload in messages:
+                if message_type == MSG_WIN and len(payload) >= 2:
+                    winner = int(payload[0])
+                    win_reason = int(payload[1])
+                elif message_type == MSG_NEW_TURN and payload:
+                    turn_player = int(payload[0])
+                    turn_count += 1
+                    summons_this_turn = [0, 0]
+                elif message_type == MSG_NEW_PHASE and len(payload) >= 2:
+                    phase = int(struct.unpack_from("<H", payload, 0)[0])
+                elif message_type in (
+                    MSG_SUMMONING,
+                    MSG_SPSUMMONING,
+                    MSG_FLIPSUMMONING,
+                ) and len(payload) >= 5:
+                    controller = int(payload[4])
+                    if controller in (0, 1):
+                        summons_this_turn[controller] += 1
+
+            if winner is not None:
+                return {
+                    "status": "duel_end",
+                    "winner": winner,
+                    "win_reason": win_reason,
+                    "turn_count": turn_count,
+                    "turn_player": turn_player,
+                    "phase": phase,
+                    "decisions": decisions,
+                    "summons_this_turn": summons_this_turn,
+                    "trace": action_trace[-240:],
+                    "counts": self.counts(0),
+                    "opponent_counts": self.counts(1),
+                    "errors": self.errors[-20:],
+                }
+
+            if stop_after_turns > 0 and turn_count > stop_after_turns:
+                return {
+                    "status": "turn_limit_reached",
+                    "winner": None,
+                    "win_reason": None,
+                    "turn_count": turn_count,
+                    "turn_player": turn_player,
+                    "phase": phase,
+                    "decisions": decisions,
+                    "summons_this_turn": summons_this_turn,
+                    "trace": action_trace[-240:],
+                    "counts": self.counts(0),
+                    "opponent_counts": self.counts(1),
+                    "errors": self.errors[-20:],
+                }
+
+            if any(message_type == MSG_RETRY for message_type, _ in messages):
+                return {
+                    "status": "retry_error",
+                    "winner": None,
+                    "turn_count": turn_count,
+                    "decisions": decisions,
+                    "trace": action_trace[-240:],
+                    "counts": self.counts(0),
+                    "opponent_counts": self.counts(1),
+                    "errors": self.errors[-20:],
+                }
+            if status == OCG_DUEL_STATUS_END:
+                return {
+                    "status": "duel_end_no_winner_message",
+                    "winner": winner,
+                    "win_reason": win_reason,
+                    "turn_count": turn_count,
+                    "decisions": decisions,
+                    "trace": action_trace[-240:],
+                    "counts": self.counts(0),
+                    "opponent_counts": self.counts(1),
+                    "errors": self.errors[-20:],
+                }
+            if status != OCG_DUEL_STATUS_AWAITING:
+                continue
+            if not messages:
+                return {
+                    "status": "awaiting_without_message",
+                    "winner": None,
+                    "turn_count": turn_count,
+                    "decisions": decisions,
+                    "trace": action_trace[-240:],
+                    "counts": self.counts(0),
+                    "opponent_counts": self.counts(1),
+                    "errors": self.errors[-20:],
+                }
+
+            message_type, payload = messages[-1]
+            branch = self.parse_branch(message_type, payload)
+            if branch and branch.get("options"):
+                player = int(branch.get("player", 0))
+                options = branch["options"]
+                selected = self._choose_autoplay_option(
+                    branch,
+                    profile=profiles[player],
+                    reaction_priority=reaction_priorities[player],
+                    target_priority=target_priorities[player],
+                    reaction_hold_windows=reaction_hold_windows[player],
+                    reaction_min_opponent_summons=reaction_min_opponent_summons[player],
+                    reaction_windows_seen=reaction_windows_seen[player],
+                    summons_this_turn=summons_this_turn,
+                )
+                selected = max(0, min(int(selected), len(options) - 1))
+                option = options[selected]
+                action_trace.append(
+                    {
+                        "decision": decisions + 1,
+                        "turn": turn_count,
+                        "phase": phase,
+                        "player": player,
+                        "message": branch.get("message"),
+                        "option_index": selected,
+                        "kind": option.get("kind"),
+                        "label": option.get("label"),
+                        "code": int(option.get("code", 0)),
+                        "summons_this_turn": list(summons_this_turn),
+                    }
+                )
+                decisions += 1
+                if decisions >= max_decisions:
+                    return {
+                        "status": "decision_budget_exhausted",
+                        "winner": None,
+                        "turn_count": turn_count,
+                        "decisions": decisions,
+                        "trace": action_trace[-240:],
+                        "counts": self.counts(0),
+                        "opponent_counts": self.counts(1),
+                        "errors": self.errors[-20:],
+                    }
+                self.set_response(bytes.fromhex(option["_response_hex"]))
+                continue
+
+            automatic = self.default_response(message_type, payload)
+            if automatic is None:
+                return {
+                    "status": "unsupported_prompt",
+                    "winner": None,
+                    "turn_count": turn_count,
+                    "decisions": decisions,
+                    "message": MSG_NAMES.get(message_type, f"MSG_{message_type}"),
+                    "raw_payload_hex": payload.hex(),
+                    "trace": action_trace[-240:],
+                    "counts": self.counts(0),
+                    "opponent_counts": self.counts(1),
+                    "errors": self.errors[-20:],
+                }
+            self.set_response(automatic)
+
+        return {
+            "status": "process_budget_exhausted",
+            "winner": None,
+            "turn_count": turn_count,
+            "decisions": decisions,
+            "last_messages": last_messages,
+            "trace": action_trace[-240:],
+            "counts": self.counts(0),
+            "opponent_counts": self.counts(1),
+            "errors": self.errors[-20:],
+        }
 
     def replay_policy(
         self,
@@ -1195,6 +1634,203 @@ def validate_input_deck(
     }
 
 
+def normalize_int_map(values: dict[str, int] | None) -> dict[int, int]:
+    out: dict[int, int] = {}
+    for key, value in (values or {}).items():
+        try:
+            out[int(key)] = int(value)
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
+def runtime_fingerprint() -> dict[str, Any]:
+    try:
+        return json.loads(FINGERPRINT_PATH.read_text())
+    except Exception:
+        return {
+            "bridge_version": "0.4.0",
+            "fingerprint_status": "unavailable",
+        }
+
+
+def compact_game_result(result: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "status": result.get("status"),
+        "winner": result.get("winner"),
+        "named_winner": result.get("named_winner"),
+        "win_reason": result.get("win_reason"),
+        "turn_count": result.get("turn_count"),
+        "decisions": result.get("decisions"),
+        "counts": result.get("counts", {}),
+        "opponent_counts": result.get("opponent_counts", {}),
+        "trace_tail": result.get("trace", [])[-24:],
+        "errors": result.get("errors", [])[-8:],
+    }
+
+
+def run_autoplay_game_impl(
+    main_a: list[int],
+    extra_a: list[int],
+    main_b: list[int],
+    extra_b: list[int],
+    *,
+    a_seat: int,
+    seed: int,
+    profile_a: str,
+    profile_b: str,
+    reaction_priority_a: list[int],
+    reaction_priority_b: list[int],
+    target_priority_a: list[int],
+    target_priority_b: list[int],
+    reaction_hold_windows_a: dict[int, int],
+    reaction_hold_windows_b: dict[int, int],
+    reaction_min_summons_a: dict[int, int],
+    reaction_min_summons_b: dict[int, int],
+    opening_hand_a: list[int] | None = None,
+    opening_hand_b: list[int] | None = None,
+    max_decisions: int = 600,
+    max_process_steps: int = 6000,
+    stop_after_turns: int = 0,
+) -> dict[str, Any]:
+    a_seat = 0 if int(a_seat) == 0 else 1
+    if a_seat == 0:
+        seat_main = (main_a, main_b)
+        seat_extra = (extra_a, extra_b)
+        seat_opening = (opening_hand_a, opening_hand_b)
+        profiles = (profile_a, profile_b)
+        reactions = (reaction_priority_a, reaction_priority_b)
+        targets = (target_priority_a, target_priority_b)
+        holds = (reaction_hold_windows_a, reaction_hold_windows_b)
+        min_summons = (reaction_min_summons_a, reaction_min_summons_b)
+    else:
+        seat_main = (main_b, main_a)
+        seat_extra = (extra_b, extra_a)
+        seat_opening = (opening_hand_b, opening_hand_a)
+        profiles = (profile_b, profile_a)
+        reactions = (reaction_priority_b, reaction_priority_a)
+        targets = (target_priority_b, target_priority_a)
+        holds = (reaction_hold_windows_b, reaction_hold_windows_a)
+        min_summons = (reaction_min_summons_b, reaction_min_summons_a)
+
+    duel = DuelBridge(
+        get_core(),
+        get_db(),
+        seat_main[0],
+        seat_extra[0],
+        seat_opening[0] or None,
+        opponent_main=seat_main[1],
+        opponent_extra=seat_extra[1],
+        opponent_opening_hand=seat_opening[1] or None,
+        seed=int(seed),
+    )
+    try:
+        result = duel.autoplay(
+            profiles=profiles,
+            reaction_priorities=reactions,
+            target_priorities=targets,
+            reaction_hold_windows=holds,
+            reaction_min_opponent_summons=min_summons,
+            max_decisions=max(20, min(int(max_decisions), 1500)),
+            max_process_steps=max(200, min(int(max_process_steps), 12000)),
+            stop_after_turns=max(0, int(stop_after_turns)),
+        )
+    finally:
+        duel.close()
+
+    result["a_seat"] = a_seat
+    if result.get("winner") in (0, 1):
+        result["named_winner"] = (
+            "A"
+            if int(result["winner"]) == a_seat
+            else "B"
+        )
+    else:
+        result["named_winner"] = None
+    result["runtime_fingerprint"] = runtime_fingerprint()
+    return result
+
+
+def run_bo3_impl(
+    main_a: list[int],
+    extra_a: list[int],
+    main_b: list[int],
+    extra_b: list[int],
+    *,
+    seed: int,
+    profile_a: str,
+    profile_b: str,
+    reaction_priority_a: list[int],
+    reaction_priority_b: list[int],
+    target_priority_a: list[int],
+    target_priority_b: list[int],
+    reaction_hold_windows_a: dict[int, int],
+    reaction_hold_windows_b: dict[int, int],
+    reaction_min_summons_a: dict[int, int],
+    reaction_min_summons_b: dict[int, int],
+    max_decisions: int,
+    max_process_steps: int,
+) -> dict[str, Any]:
+    score = {"A": 0, "B": 0}
+    games: list[dict[str, Any]] = []
+    a_seat = 0
+
+    for game_index in range(3):
+        result = run_autoplay_game_impl(
+            main_a,
+            extra_a,
+            main_b,
+            extra_b,
+            a_seat=a_seat,
+            seed=int(seed) + game_index,
+            profile_a=profile_a,
+            profile_b=profile_b,
+            reaction_priority_a=reaction_priority_a,
+            reaction_priority_b=reaction_priority_b,
+            target_priority_a=target_priority_a,
+            target_priority_b=target_priority_b,
+            reaction_hold_windows_a=reaction_hold_windows_a,
+            reaction_hold_windows_b=reaction_hold_windows_b,
+            reaction_min_summons_a=reaction_min_summons_a,
+            reaction_min_summons_b=reaction_min_summons_b,
+            max_decisions=max_decisions,
+            max_process_steps=max_process_steps,
+        )
+        compact = compact_game_result(result)
+        compact["game"] = game_index + 1
+        compact["a_seat"] = a_seat
+        games.append(compact)
+
+        winner = result.get("named_winner")
+        if winner not in {"A", "B"}:
+            return {
+                "status": "incomplete",
+                "match_winner": None,
+                "score": score,
+                "games": games,
+                "reason": f"game_{game_index + 1}_{result.get('status')}",
+            }
+
+        score[winner] += 1
+        if score[winner] >= 2:
+            return {
+                "status": "complete",
+                "match_winner": winner,
+                "score": score,
+                "games": games,
+            }
+
+        loser = "B" if winner == "A" else "A"
+        a_seat = 0 if loser == "A" else 1
+
+    return {
+        "status": "complete",
+        "match_winner": "A" if score["A"] > score["B"] else "B",
+        "score": score,
+        "games": games,
+    }
+
+
 def build_handtrap_opponent(
     handtrap_codes: list[int] | None,
 ) -> tuple[list[int], list[int]]:
@@ -1434,12 +2070,12 @@ mcp = MCPServer("verify-tournament-deck-edopro-sim")
 
 @mcp.tool()
 def edopro_engine_status() -> dict[str, Any]:
-    """Report the installed ocgcore/CardScripts/BabelCDB runtime and v0.3 capability matrix."""
+    """Report the installed ocgcore/CardScripts/BabelCDB runtime and v0.4 capability matrix."""
     core = get_core()
     major, minor = core.version()
     return {
         "ok": True,
-        "bridge_version": "0.3.0",
+        "bridge_version": "0.4.0",
         "ocgcore_version": f"{major}.{minor}",
         "paths": {
             "library": str(LIB_PATH),
@@ -1447,6 +2083,7 @@ def edopro_engine_status() -> dict[str, Any]:
             "cards_cdb": str(CDB_PATH),
         },
         "rules_profile": "OCG Master Rule 5",
+        "runtime_fingerprint": runtime_fingerprint(),
         "capabilities": {
             "real_ocgcore_rules_engine": True,
             "ydk_export": True,
@@ -1458,7 +2095,11 @@ def edopro_engine_status() -> dict[str, Any]:
             "heuristic_combo_route_search": True,
             "autonomous_handtrap_adversary": True,
             "batch_handtrap_stress": True,
-            "autonomous_full_match_bot": False,
+            "strategic_reaction_timing": True,
+            "autonomous_dual_policy_game": True,
+            "seat_swapped_bo3": True,
+            "full_match_batch": True,
+            "autonomous_full_match_bot": "heuristic",
         },
     }
 
@@ -1473,7 +2114,7 @@ def edopro_export_ydk(
     main_codes = clean_codes(main)
     extra_codes = clean_codes(extra)
     side_codes = clean_codes(side)
-    lines = ["#created by Verify Tournament Deck v0.3.0", "#main"]
+    lines = ["#created by Verify Tournament Deck v0.4.0", "#main"]
     lines.extend(str(code) for code in main_codes)
     lines.append("#extra")
     lines.extend(str(code) for code in extra_codes)
@@ -1711,7 +2352,7 @@ def edopro_batch_stress(
 ) -> dict[str, Any]:
     """Run multiple automatic ocgcore stress games with sampled five-card openings.
 
-    Candidate play uses the v0.3 greedy legal-action policy; the opponent uses
+    Candidate play uses the v0.4 greedy legal-action policy; the opponent uses
     supplied hand traps at their first legal timing. The reported pass rate is a
     stress-test success rate against the requested board thresholds, not a match win rate.
     """
@@ -1808,6 +2449,324 @@ def edopro_batch_stress(
     }
 
 
+@mcp.tool()
+def edopro_evaluate_handtrap_timing(
+    main: list[int],
+    extra: list[int] | None = None,
+    opening_hand: list[int] | None = None,
+    handtrap_code: int = 0,
+    max_hold_windows: int = 3,
+    min_opponent_summons: int = 0,
+    seed: int = 1,
+    profile: str = "balanced",
+) -> dict[str, Any]:
+    """Compare several legal activation windows for one supplied hand trap.
+
+    The opponent is an inert 40-card shell with the requested hand trap fixed
+    in its opening hand. Candidate play is heuristic. Lower candidate board
+    score means the hand-trap timing disrupted the candidate more strongly.
+    """
+    main_codes = clean_codes(main)
+    extra_codes = clean_codes(extra)
+    hand_codes = clean_codes(opening_hand)
+    code = int(handtrap_code)
+    validation = validate_input_deck(main_codes, extra_codes)
+    if not validation["ok_for_simulation"]:
+        return {"status": "invalid_deck", "validation": validation}
+    if hand_codes and len(hand_codes) != 5:
+        return {
+            "status": "invalid_opening_hand",
+            "reason": "opening_hand must contain exactly 5 card passcodes when supplied",
+        }
+    if not code or not get_db().exists(code):
+        return {"status": "invalid_handtrap_code", "code": code}
+
+    opponent_main, opponent_opening = build_handtrap_opponent([code])
+    rows: list[dict[str, Any]] = []
+    max_hold_windows = max(0, min(int(max_hold_windows), 8))
+    for hold in range(max_hold_windows + 1):
+        result = run_autoplay_game_impl(
+            main_codes,
+            extra_codes,
+            opponent_main,
+            [],
+            a_seat=0,
+            seed=int(seed),
+            profile_a=profile,
+            profile_b="passive",
+            reaction_priority_a=[],
+            reaction_priority_b=[code],
+            target_priority_a=[],
+            target_priority_b=[],
+            reaction_hold_windows_a={},
+            reaction_hold_windows_b={code: hold},
+            reaction_min_summons_a={},
+            reaction_min_summons_b={code: max(0, int(min_opponent_summons))},
+            opening_hand_a=hand_codes or None,
+            opening_hand_b=opponent_opening,
+            max_decisions=220,
+            max_process_steps=3500,
+            stop_after_turns=1,
+        )
+        score = route_score(result)
+        activations = [
+            row
+            for row in result.get("trace", [])
+            if row.get("player") == 1
+            and row.get("kind") == "chain"
+            and int(row.get("code", 0)) == code
+        ]
+        rows.append(
+            {
+                "hold_legal_windows": hold,
+                "status": result.get("status"),
+                "activated": bool(activations),
+                "activation": activations[0] if activations else None,
+                "candidate_board_score": score,
+                "candidate_counts": result.get("counts", {}),
+                "trace_tail": result.get("trace", [])[-18:],
+                "errors": result.get("errors", [])[-6:],
+            }
+        )
+
+    activated_rows = [row for row in rows if row["activated"]]
+    best = min(activated_rows, key=lambda row: row["candidate_board_score"]) if activated_rows else None
+    return {
+        "status": "complete" if rows else "incomplete",
+        "handtrap": {"code": code, "name": get_db().name(code)},
+        "min_opponent_summons": max(0, int(min_opponent_summons)),
+        "timings": rows,
+        "strongest_observed_timing": best,
+        "interpretation": (
+            "Lower candidate_board_score means stronger disruption in this bounded "
+            "heuristic first-turn scenario; it is not a proof of globally optimal timing."
+        ),
+        "runtime_fingerprint": runtime_fingerprint(),
+    }
+
+
+@mcp.tool()
+def edopro_autoplay_game(
+    main_a: list[int],
+    extra_a: list[int] | None,
+    main_b: list[int],
+    extra_b: list[int] | None,
+    seed: int = 1,
+    a_seat: int = 0,
+    profile_a: str = "balanced",
+    profile_b: str = "balanced",
+    reaction_priority_a: list[int] | None = None,
+    reaction_priority_b: list[int] | None = None,
+    target_priority_a: list[int] | None = None,
+    target_priority_b: list[int] | None = None,
+    reaction_hold_windows_a: dict[str, int] | None = None,
+    reaction_hold_windows_b: dict[str, int] | None = None,
+    reaction_min_summons_a: dict[str, int] | None = None,
+    reaction_min_summons_b: dict[str, int] | None = None,
+    max_decisions: int = 600,
+    max_process_steps: int = 6000,
+) -> dict[str, Any]:
+    """Run one headless real-ocgcore duel with heuristic policies for both decks."""
+    a_main = clean_codes(main_a)
+    a_extra = clean_codes(extra_a)
+    b_main = clean_codes(main_b)
+    b_extra = clean_codes(extra_b)
+    validation_a = validate_input_deck(a_main, a_extra)
+    validation_b = validate_input_deck(b_main, b_extra)
+    if not validation_a["ok_for_simulation"] or not validation_b["ok_for_simulation"]:
+        return {
+            "status": "invalid_deck",
+            "validation_a": validation_a,
+            "validation_b": validation_b,
+        }
+    result = run_autoplay_game_impl(
+        a_main,
+        a_extra,
+        b_main,
+        b_extra,
+        a_seat=a_seat,
+        seed=seed,
+        profile_a=profile_a,
+        profile_b=profile_b,
+        reaction_priority_a=clean_codes(reaction_priority_a),
+        reaction_priority_b=clean_codes(reaction_priority_b),
+        target_priority_a=clean_codes(target_priority_a),
+        target_priority_b=clean_codes(target_priority_b),
+        reaction_hold_windows_a=normalize_int_map(reaction_hold_windows_a),
+        reaction_hold_windows_b=normalize_int_map(reaction_hold_windows_b),
+        reaction_min_summons_a=normalize_int_map(reaction_min_summons_a),
+        reaction_min_summons_b=normalize_int_map(reaction_min_summons_b),
+        max_decisions=max_decisions,
+        max_process_steps=max_process_steps,
+    )
+    result["validation_a"] = validation_a
+    result["validation_b"] = validation_b
+    result["policy_note"] = (
+        "Both players use transparent heuristic action selection. This is an "
+        "autonomous rules-valid duel harness, not an optimal-play engine."
+    )
+    return result
+
+
+@mcp.tool()
+def edopro_bo3_match(
+    main_a: list[int],
+    extra_a: list[int] | None,
+    main_b: list[int],
+    extra_b: list[int] | None,
+    seed: int = 1,
+    profile_a: str = "balanced",
+    profile_b: str = "balanced",
+    reaction_priority_a: list[int] | None = None,
+    reaction_priority_b: list[int] | None = None,
+    target_priority_a: list[int] | None = None,
+    target_priority_b: list[int] | None = None,
+    reaction_hold_windows_a: dict[str, int] | None = None,
+    reaction_hold_windows_b: dict[str, int] | None = None,
+    reaction_min_summons_a: dict[str, int] | None = None,
+    reaction_min_summons_b: dict[str, int] | None = None,
+    max_decisions: int = 600,
+    max_process_steps: int = 6000,
+) -> dict[str, Any]:
+    """Run a no-side best-of-three match. The previous-game loser is put in seat 0 next game."""
+    a_main = clean_codes(main_a)
+    a_extra = clean_codes(extra_a)
+    b_main = clean_codes(main_b)
+    b_extra = clean_codes(extra_b)
+    validation_a = validate_input_deck(a_main, a_extra)
+    validation_b = validate_input_deck(b_main, b_extra)
+    if not validation_a["ok_for_simulation"] or not validation_b["ok_for_simulation"]:
+        return {
+            "status": "invalid_deck",
+            "validation_a": validation_a,
+            "validation_b": validation_b,
+        }
+    result = run_bo3_impl(
+        a_main,
+        a_extra,
+        b_main,
+        b_extra,
+        seed=seed,
+        profile_a=profile_a,
+        profile_b=profile_b,
+        reaction_priority_a=clean_codes(reaction_priority_a),
+        reaction_priority_b=clean_codes(reaction_priority_b),
+        target_priority_a=clean_codes(target_priority_a),
+        target_priority_b=clean_codes(target_priority_b),
+        reaction_hold_windows_a=normalize_int_map(reaction_hold_windows_a),
+        reaction_hold_windows_b=normalize_int_map(reaction_hold_windows_b),
+        reaction_min_summons_a=normalize_int_map(reaction_min_summons_a),
+        reaction_min_summons_b=normalize_int_map(reaction_min_summons_b),
+        max_decisions=max_decisions,
+        max_process_steps=max_process_steps,
+    )
+    result["validation_a"] = validation_a
+    result["validation_b"] = validation_b
+    result["side_deck"] = False
+    result["seat_policy"] = (
+        "Game 1: A in seat 0. Later games: previous-game loser is placed in seat 0, "
+        "modeling the loser choosing to go first."
+    )
+    result["runtime_fingerprint"] = runtime_fingerprint()
+    return result
+
+
+@mcp.tool()
+def edopro_full_match_batch(
+    main_a: list[int],
+    extra_a: list[int] | None,
+    main_b: list[int],
+    extra_b: list[int] | None,
+    matches: int = 5,
+    seed: int = 1,
+    profile_a: str = "balanced",
+    profile_b: str = "balanced",
+    reaction_priority_a: list[int] | None = None,
+    reaction_priority_b: list[int] | None = None,
+    target_priority_a: list[int] | None = None,
+    target_priority_b: list[int] | None = None,
+    reaction_hold_windows_a: dict[str, int] | None = None,
+    reaction_hold_windows_b: dict[str, int] | None = None,
+    reaction_min_summons_a: dict[str, int] | None = None,
+    reaction_min_summons_b: dict[str, int] | None = None,
+    max_decisions: int = 600,
+    max_process_steps: int = 6000,
+) -> dict[str, Any]:
+    """Run repeated no-side BO3 matches and aggregate heuristic-agent results."""
+    a_main = clean_codes(main_a)
+    a_extra = clean_codes(extra_a)
+    b_main = clean_codes(main_b)
+    b_extra = clean_codes(extra_b)
+    validation_a = validate_input_deck(a_main, a_extra)
+    validation_b = validate_input_deck(b_main, b_extra)
+    if not validation_a["ok_for_simulation"] or not validation_b["ok_for_simulation"]:
+        return {
+            "status": "invalid_deck",
+            "validation_a": validation_a,
+            "validation_b": validation_b,
+        }
+
+    matches = max(1, min(int(matches), 20))
+    completed = 0
+    wins = Counter()
+    rows: list[dict[str, Any]] = []
+    for index in range(matches):
+        match = run_bo3_impl(
+            a_main,
+            a_extra,
+            b_main,
+            b_extra,
+            seed=int(seed) + index * 100,
+            profile_a=profile_a,
+            profile_b=profile_b,
+            reaction_priority_a=clean_codes(reaction_priority_a),
+            reaction_priority_b=clean_codes(reaction_priority_b),
+            target_priority_a=clean_codes(target_priority_a),
+            target_priority_b=clean_codes(target_priority_b),
+            reaction_hold_windows_a=normalize_int_map(reaction_hold_windows_a),
+            reaction_hold_windows_b=normalize_int_map(reaction_hold_windows_b),
+            reaction_min_summons_a=normalize_int_map(reaction_min_summons_a),
+            reaction_min_summons_b=normalize_int_map(reaction_min_summons_b),
+            max_decisions=max_decisions,
+            max_process_steps=max_process_steps,
+        )
+        if match.get("status") == "complete":
+            completed += 1
+            if match.get("match_winner") in {"A", "B"}:
+                wins[str(match["match_winner"])] += 1
+        rows.append(
+            {
+                "match": index + 1,
+                "status": match.get("status"),
+                "winner": match.get("match_winner"),
+                "score": match.get("score"),
+                "games": match.get("games", []),
+                "reason": match.get("reason"),
+            }
+        )
+
+    return {
+        "status": "complete" if completed == matches else "partially_complete",
+        "matches_requested": matches,
+        "matches_completed": completed,
+        "completion_rate": round(completed / matches, 6),
+        "match_wins": {"A": wins["A"], "B": wins["B"]},
+        "heuristic_match_win_rate_a": (
+            round(wins["A"] / completed, 6) if completed else None
+        ),
+        "matches": rows,
+        "validation_a": validation_a,
+        "validation_b": validation_b,
+        "side_deck": False,
+        "runtime_fingerprint": runtime_fingerprint(),
+        "warning": (
+            "The win rate is produced by deterministic heuristic agents on real "
+            "ocgcore rules. It is not a tournament win-rate estimate and must be "
+            "calibrated against human/EDOPro match data before Reality Calibration."
+        ),
+    }
+
+
 _selftest_cache: dict[str, Any] | None = None
 
 
@@ -1857,7 +2816,7 @@ async def health(_request):
             {
                 "ok": ok,
                 "service": "verify-tournament-deck-edopro-sim",
-                "version": "0.3.0",
+                "version": "0.4.0",
                 "ocgcore": f"{major}.{minor}",
                 "cards_cdb": CDB_PATH.exists(),
                 "cardscripts": SCRIPTS.exists(),
