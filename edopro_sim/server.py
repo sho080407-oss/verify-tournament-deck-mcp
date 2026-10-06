@@ -1046,18 +1046,62 @@ def edopro_replay_choices(
         duel.close()
 
 
+_selftest_cache: dict[str, Any] | None = None
+
+
+def run_engine_selftest() -> dict[str, Any]:
+    """Create and process a real ocgcore duel once to prove the runtime is executable."""
+    global _selftest_cache
+    if _selftest_cache is not None:
+        return _selftest_cache
+
+    duel: DuelBridge | None = None
+    try:
+        db = get_db()
+        if not db.exists(DUMMY_OPPONENT):
+            raise RuntimeError(f"self-test card {DUMMY_OPPONENT} is missing from cards.cdb")
+        duel = DuelBridge(
+            get_core(),
+            db,
+            [DUMMY_OPPONENT] * 40,
+            [],
+            opening_hand=None,
+            seed=1,
+        )
+        result = duel.replay([], max_process_steps=120)
+        ok = result.get("status") == "awaiting_choice"
+        _selftest_cache = {
+            "ok": ok,
+            "status": result.get("status"),
+            "decision": result.get("decision"),
+            "counts": result.get("counts"),
+            "errors": result.get("errors", [])[-5:],
+        }
+        return _selftest_cache
+    except Exception as exc:
+        _selftest_cache = {"ok": False, "status": "exception", "error": str(exc)}
+        return _selftest_cache
+    finally:
+        if duel is not None:
+            duel.close()
+
+
 async def health(_request):
     try:
         major, minor = get_core().version()
+        selftest = run_engine_selftest()
+        ok = bool(selftest.get("ok"))
         return JSONResponse(
             {
-                "ok": True,
+                "ok": ok,
                 "service": "verify-tournament-deck-edopro-sim",
                 "version": "0.2.0",
                 "ocgcore": f"{major}.{minor}",
                 "cards_cdb": CDB_PATH.exists(),
                 "cardscripts": SCRIPTS.exists(),
-            }
+                "engine_selftest": selftest,
+            },
+            status_code=200 if ok else 503,
         )
     except Exception as exc:
         return JSONResponse({"ok": False, "error": str(exc)}, status_code=503)
