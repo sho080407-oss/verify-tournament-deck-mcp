@@ -70,9 +70,11 @@ COPY server.py /app/server.py
 
 # MCP SDK v1 compatibility shim: retain every EDOPro tool and only swap the
 # server transport wrapper from MCPServer(v2) to FastMCP(v1).
+# Keep DNS rebinding protection enabled and allow only the deployed public host
+# in addition to SDK loopback defaults; otherwise initialize returns HTTP 421.
 RUN sed -i \
-      -e 's/from mcp\.server\.mcpserver import MCPServer/from mcp.server.fastmcp import FastMCP/' \
-      -e 's/mcp = MCPServer("verify-tournament-deck-edopro-sim")/mcp = FastMCP("verify-tournament-deck-edopro-sim", json_response=True)/' \
+      -e 's/from mcp\.server\.mcpserver import MCPServer/from mcp.server.fastmcp import FastMCP; from mcp.server.transport_security import TransportSecuritySettings/' \
+      -e 's/mcp = MCPServer("verify-tournament-deck-edopro-sim")/mcp = FastMCP("verify-tournament-deck-edopro-sim", json_response=True, transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=True, allowed_hosts=["127.0.0.1:*", "localhost:*", "[::1]:*", "verify-tournament-deck-edopro-sim-production.up.railway.app", "verify-tournament-deck-edopro-sim-production.up.railway.app:443"], allowed_origins=["http:\/\/127.0.0.1:*", "http:\/\/localhost:*", "http:\/\/[::1]:*", "https:\/\/verify-tournament-deck-edopro-sim-production.up.railway.app"]))/' \
       /app/server.py \
     && sed -i '/^mcp_app = mcp\.streamable_http_app(/,/^)/c\mcp_app = mcp.streamable_http_app()' /app/server.py
 
